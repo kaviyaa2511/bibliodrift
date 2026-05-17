@@ -11,8 +11,10 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from sqlalchemy.orm import joinedload
 from flask_migrate import Migrate
+from flask_wtf.csrf import CSRFProtect, generate_csrf, CSRFError
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
+from backend.spine_generator import create_spine
 import os
 import requests
 import secrets
@@ -24,6 +26,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sanitizer import sanitize_payload
+from reader_identity.routes import reader_identity_bp
 
 # Load environment variables from config directory based on APP_ENV
 env = os.getenv('APP_ENV', 'development')
@@ -36,6 +39,7 @@ elif os.path.exists(backend_env_path):
 else:
     load_dotenv()
 
+# Environment variables are now loaded centrally in backend/config.py
 from config import app_config, setup_logging, validate_required_env_vars
 from ai_service import generate_book_note, get_ai_recommendations, get_category_books, get_book_mood_tags_safe, generate_chat_response, llm_service
 from models import db, User, Book, ShelfItem, BookNote, ReadingGoal, ReadingStats, Collection, CollectionItem, PriceHistory, PriceAlert, Review, register_user, login_user
@@ -105,6 +109,7 @@ except ImportError:
 # to ensure API integrity across all origins.
 # =====================================================================
 app = Flask(__name__, static_folder='.', static_url_path='')
+app.register_blueprint(reader_identity_bp)
 
 # Validate required environment variables at startup
 # This will raise ValueError if any required variables are missing
@@ -112,6 +117,28 @@ validate_required_env_vars()
 
 # Apply configuration to Flask app
 app.config.update(app_config.flask_config)
+
+# =====================================================================
+# SECURITY COMPLIANCE UPDATE: CSRF PROTECTION (FLASK-WTF)
+# =====================================================================
+# Cross-Site Request Forgery (CSRF) is a serious vulnerability where 
+# an attacker tricks a user into performing actions they didn't intend
+# to do on a different website where they are authenticated.
+#
+# While JWT-Extended provides CSRF protection for authenticated 
+# requests via cookies, the initial authentication flow (Login/Register) 
+# often remains vulnerable if not explicitly protected.
+#
+# We initialize Flask-WTF's CSRFProtect to provide a secondary layer
+# of defense. This will automatically validate CSRF tokens for all
+# POST, PUT, PATCH, and DELETE requests.
+# =====================================================================
+csrf = CSRFProtect(app)
+
+# Exclude certain endpoints from global CSRF if they are handled by JWT CSRF
+# or if they are intended to be public-facing without token requirements.
+# In this architecture, we prefer explicit protection on all mutation routes.
+# csrf.exempt(some_blueprint) 
 
 # Initialize JWT Manager
 jwt = JWTManager(app)
@@ -158,6 +185,30 @@ def page_not_found(e: Exception):
     return app.send_static_file('404.html'), 404
 
 
+@app.errorhandler(CSRFError)
+def handle_csrf_error(e):
+    """
+    =========================================================================
+    CUSTOM CSRF ERROR HANDLER
+    =========================================================================
+    Intercepts CSRF validation failures and returns a standardized JSON 
+    error response instead of the default HTML error page.
+    
+    This is critical for a RESTful API architecture where the client 
+    expects consistent JSON structures even during security failures.
+    
+    Status: 400 Bad Request (as per Flask-WTF default for CSRF failures)
+    =========================================================================
+    """
+    logger.warning(f"CSRF Validation Failed: {e.description} | Remote IP: {request.remote_addr}")
+    return jsonify({
+        "success": False,
+        "error": "CSRF_VALIDATION_FAILED",
+        "message": f"Security token validation failed: {e.description}. Please refresh the page.",
+        "code": 400
+    }), 400
+
+
 @app.after_request
 def add_security_headers(response):
     """
@@ -177,17 +228,6 @@ def add_security_headers(response):
     Returns:
         response: Response with added security headers
     """
-    # Content Security Policy: Restrict resource loading to prevent inline scripts/XSS
-    # - default-src 'self': Only allow resources from the same origin
-    # - script-src 'self' https://cdn.jsdelivr.net: Allow scripts from self and DOMPurify CDN
-    # - style-src 'self' https://fonts.googleapis.com https://cdnjs.cloudflare.com: Allow styles from self and CDN
-    # - img-src 'self' data: blob: https:: Allow images from self, data URLs, blob URLs, and HTTPS
-    # - font-src 'self' https://fonts.gstatic.com: Allow fonts from self and Google Fonts
-    # - connect-src 'self' ws: wss: https:: Allow connections to own origin, secure WebSocket, and HTTPS
-    # - frame-ancestors 'none': Prevent framing/clickjacking
-    # - base-uri 'self': Restrict base tag to same origin
-    # - form-action 'self': Restrict form submissions to same origin
-    # - upgrade-insecure-requests: Upgrade HTTP to HTTPS
     csp_policy = (
         "default-src 'self'; "
         "script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; "
@@ -201,23 +241,11 @@ def add_security_headers(response):
         "upgrade-insecure-requests"
     )
     response.headers['Content-Security-Policy'] = csp_policy
-    
-    # Prevent MIME type sniffing (forces browser to respect Content-Type header)
     response.headers['X-Content-Type-Options'] = 'nosniff'
-    
-    # Prevent clickjacking by disallowing the site to be framed
     response.headers['X-Frame-Options'] = 'DENY'
-    
-    # Legacy XSS protection header (for older browsers)
     response.headers['X-XSS-Protection'] = '1; mode=block'
-    
-    # Force HTTPS for 1 year (including subdomains)
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    
-    # Control referrer information to reduce information leakage
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    
-    # Restrict permissions and features the page can use
     response.headers['Permissions-Policy'] = (
         'geolocation=(), '
         'microphone=(), '
@@ -228,7 +256,6 @@ def add_security_headers(response):
         'gyroscope=(), '
         'accelerometer=()'
     )
-    
     return response
 
 # Rate limiting configuration
@@ -339,6 +366,25 @@ def get_config():
         "google_books_key_secondary": os.getenv('GOOGLE_BOOKS_API_KEY_SECONDARY', '')
     })
 
+# =====================================================================
+# ENDPOINT: CSRF Token Retrieval
+# =====================================================================
+# Since this is a decoupled frontend, we need a way for the client-side
+# application to "prime" itself with a valid CSRF token before attempting
+# a state-mutating request (like Login or Register).
+#
+# This endpoint generates a new token and sets the associated session 
+# cookie. The frontend should call this on page load of sensitive forms.
+# =====================================================================
+@app.route('/api/v1/csrf-token', methods=['GET'])
+def get_csrf_token():
+    """
+    Generate and return a fresh CSRF token.
+    The token is automatically tied to the user's session.
+    """
+    token = generate_csrf()
+    return success_response(data={"csrf_token": token})
+
 @app.route('/')
 def index():
     """Simple index page showing available API endpoints."""
@@ -352,7 +398,8 @@ def index():
             "POST /api/v1/generate-note": "Generate AI book notes",
             "POST /api/v1/chat": "Chat with bookseller",
             "POST /api/v1/mood-search": "Search books by mood/vibe",
-            "POST /api/v1/category-books": "Get AI-curated books for a specific shelf category"
+            "POST /api/v1/category-books": "Get AI-curated books for a specific shelf category",
+            "POST /api/v1/reader-archetype":"Generate AI reader archetype",
         },
         "note": "All endpoints except / and /api/v1/health require POST requests with JSON body",
         "example_usage": {
@@ -570,6 +617,63 @@ def handle_category_books():
         logger.error(f"Error in handle_category_books: {str(e)}", exc_info=True)
         return internal_error(str(e))
 
+@app.route('/api/v1/generate-note', methods=['POST'])
+@rate_limit('generate_note')
+def handle_generate_note():
+    """Generate AI-powered book recommendation with vibe support."""
+    from exceptions import (
+        LLMCircuitBreakerOpenError, AIServiceException,
+        DatabaseQueryError, DatabaseIntegrityError,
+        ValidationException, InvalidInputError
+    )
+    from error_responses import handle_exception
+    
+    try:
+        data = request.get_json()
+        
+        is_valid, validated_data = validate_request(GenerateNoteRequest, data)
+        if not is_valid:
+            return jsonify(validated_data), 400
+        
+        description = validated_data.description
+        title = validated_data.title
+        author = validated_data.author
+        vibe = getattr(validated_data, 'vibe', 'cozy discovery')
+        
+        # Check cache
+        cached_note = BookNote.query.filter_by(book_title=title, book_author=author).first()
+        if cached_note:
+            logger.debug(f"Cache hit for {title} by {author}")
+            return success_response(data={"blurb": cached_note.content})
+        
+        # Generate AI recommendation with vibe context
+        recommendation = generate_book_note(description, title, author, vibe)
+        
+        try:
+            if recommendation and isinstance(recommendation, dict):
+                blurb_content = recommendation.get('blurb', str(recommendation))
+                new_note = BookNote(book_title=title, book_author=author, content=blurb_content)
+                db.session.add(new_note)
+                db.session.commit()
+        except SQLAlchemyError as e:
+            logger.error(f"Database error caching note: {e}")
+            db.session.rollback()
+        except Exception as e:
+            logger.error(f"Unexpected error caching note: {e}")
+            db.session.rollback()
+
+        return success_response(data=recommendation)
+        
+    except (LLMCircuitBreakerOpenError, AIServiceException) as e:
+        logger.error(f"AI service error in handle_generate_note: {e}", exc_info=True)
+        return handle_exception(e, "handle_generate_note")
+    except (ValidationException, InvalidInputError) as e:
+        logger.warning(f"Validation error in handle_generate_note: {e}")
+        return handle_exception(e, "handle_generate_note")
+    except Exception as e:
+        logger.error(f"Unexpected error in handle_generate_note: {type(e).__name__}: {e}", exc_info=True)
+        return handle_exception(e, "handle_generate_note")
+
 @app.route('/api/v1/chat', methods=['POST'])
 @rate_limit('chat')
 def handle_chat():
@@ -653,7 +757,6 @@ def health_check():
     })
 
 
-
 # =========================================================================
 # ENDPOINT: Add Book to Library
 # This endpoint allows authenticated users to add a new book to their
@@ -694,6 +797,18 @@ def add_to_library():
             )
             db.session.add(book)
             db.session.flush()
+
+            # --- DYNAMIC SPINE GENERATION FOR SINGLE ADD ---
+            try:
+                # Safely parse authors if it comes in as a list structure
+                author_str = ", ".join(validated_data.authors) if isinstance(validated_data.authors, list) else validated_data.authors
+                clean_id = "".join([c if c.isalnum() else "_" for c in validated_data.title.lower().strip()])
+                
+                # Render the image file straight to frontend assets
+                create_spine(validated_data.title, author_str, clean_id)
+            except Exception as spine_err:
+                logger.error(f"Spine generation failed during direct add: {spine_err}")
+            # -----------------------------------------------
 
         existing_item = ShelfItem.query.filter_by(user_id=validated_data.user_id, book_id=book.id).with_for_update().first()
         if existing_item:
@@ -736,7 +851,7 @@ def add_to_library():
 @app.route('/api/v1/library/<int:user_id>', methods=['GET'])
 @jwt_required()
 def get_library(user_id):
-    """Get paginated books in a user's library."""
+    """Get all books in a user's library."""
     current_user_id = get_jwt_identity()
     if str(user_id) != str(current_user_id):
         return forbidden_error("Cannot access another user's library")
@@ -930,7 +1045,7 @@ def sync_library():
             return jsonify(validated_data), 400
         
         user_id = validated_data.user_id
-        items = sanitize_payload(validated_data.items)
+        raw_items = validated_data.items
         
         if str(user_id) != str(current_user_id):
             return forbidden_error("Cannot sync to another user's library")
@@ -947,9 +1062,7 @@ def sync_library():
             for index, bad_value in invalid_ids:
                 logger.warning(
                     "Rejected sync payload with invalid Google Books ID. user_id=%s item_index=%s id=%r",
-                    user_id,
-                    index,
-                    bad_value
+                    user_id, index, bad_value
                 )
             return validation_error("Invalid Google Books ID format in sync payload")
 
@@ -989,6 +1102,15 @@ def sync_library():
                         )
                         db.session.add(book)
                         db.session.flush()
+
+                        # --- DYNAMIC SPINE GENERATION FOR BULK SYNC ---
+                        try:
+                            sync_title = volume_info.get('title', 'Untitled')
+                            clean_id = "".join([c if c.isalnum() else "_" for c in sync_title.lower().strip()])
+                            create_spine(sync_title, authors, clean_id)
+                        except Exception as spine_err:
+                            logger.error(f"Spine generation failed during bulk sync: {spine_err}")
+                        # -----------------------------------------------
 
                     existing_item = ShelfItem.query.filter_by(user_id=user_id, book_id=book.id).with_for_update().first()
                     shelf_type = item_data.get('shelf', 'want')
@@ -1036,22 +1158,22 @@ def sync_library():
 # ENDPOINT: User Registration
 # Core signup flow. Validates credentials, creates a User entity, and
 # immediately responds with an active session ready to go.
-# 
-# Security checks run here include rate limiting to prevent spam and
-# Pydantic enforcing minimum password complexities / valid email formats.
-# The user record is hashed internally inside the `register_user` util.
-# Finally, JWT access cookies are locked and loaded on the response object.
 # =========================================================================
 @app.route('/api/v1/register', methods=['POST'])
 @limiter.limit("5 per minute")
 def register():
     """Register a new user and return JWT token."""
-    from sqlalchemy.exc import IntegrityError
-    from exceptions import DatabaseIntegrityError, DatabaseQueryError, ValidationException
-    from error_responses import handle_exception
-    
     try:
         data = request.get_json()
+        
+        # =========================================================================
+        # SECURITY AUDIT: REGISTRATION ATTEMPT
+        # =========================================================================
+        # All registration attempts are logged for security auditing purposes.
+        # CSRF protection is enforced automatically by Flask-WTF for this 
+        # POST request, ensuring the signup originates from our own UI.
+        # =========================================================================
+        logger.info(f"Registration attempt for user: {data.get('username')} from IP: {request.remote_addr}")
         
         is_valid, validated_data = validate_request(RegisterRequest, data)
         if not is_valid:
@@ -1061,7 +1183,6 @@ def register():
         email = validated_data.email
         password = validated_data.password
 
-        # check if user exists
         if User.query.filter((User.username==username) | (User.email==email)).first():
             return resource_exists_error("User")
 
@@ -1099,6 +1220,15 @@ def login():
     try:
         data = request.get_json()
         
+        # =========================================================================
+        # SECURITY AUDIT: LOGIN ATTEMPT
+        # =========================================================================
+        # All login attempts are strictly validated against CSRF tokens.
+        # This prevents an attacker from creating a malicious site that 
+        # automatically logs a user into an account they control.
+        # =========================================================================
+        logger.info(f"Login attempt for identifier: {data.get('username')} from IP: {request.remote_addr}")
+        
         is_valid, validated_data = validate_request(LoginRequest, data)
         if not is_valid:
             return jsonify(validated_data), 400
@@ -1106,11 +1236,9 @@ def login():
         username_or_email = validated_data.username
         password = validated_data.password
 
-        # Try to find user by username or email
         user = User.query.filter((User.username==username_or_email) | (User.email==username_or_email)).first()
         
         if user and user.check_password(password):
-            # Create JWT token
             access_token = create_access_token(identity=str(user.id))
             
             resp, status = success_response(
@@ -1286,12 +1414,27 @@ def logout():
     return resp, status
 
 
+@app.route('/api/v1/auth/verify', methods=['GET'])
+@jwt_required()
+def verify_auth_session():
+    """Validate JWT from access cookie and return the current user (session restore)."""
+    try:
+        uid = get_jwt_identity()
+        user = User.query.get(int(uid))
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        return jsonify({
+            "user": {"id": user.id, "username": user.username, "email": user.email}
+        }), 200
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid session"}), 401
+
+
 # ==================== READING STATS ENDPOINTS ====================
 @app.route('/api/v1/stats/goal', methods=['POST'])
 @jwt_required()
 def set_reading_goal():
     """Set or update annual reading goal."""
-    # Use get_json(silent=True) to avoid automatic 400 on malformed JSON
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -1332,15 +1475,6 @@ def set_reading_goal():
 def get_reading_stats():
     """Get reading statistics for the user."""
     user_id = request.args.get('user_id', type=int)
-    
-    # =========================================================================
-    # TIMEZONE-AWARE YEAR RESOLUTION
-    # =========================================================================
-    # The default year is dynamically resolved using a timezone-aware UTC 
-    # datetime object. This avoids edge cases near New Year's Eve where a server 
-    # running in a different timezone might incorrectly calculate the 'current'
-    # year relative to the user's local time or universal time.
-    # =========================================================================
     year = request.args.get('year', datetime.now(timezone.utc).year, type=int)
     
     if not user_id:
@@ -1376,25 +1510,12 @@ def get_reading_stats():
 @jwt_required()
 def get_leaderboard():
     """Get community reading leaderboard."""
-    
-    # =========================================================================
-    # TIMEZONE-AWARE YEAR RESOLUTION (LEADERBOARD)
-    # =========================================================================
-    # Similar to reading stats, the leaderboard must ensure the default year
-    # aligns with UTC correctly. Relying on naive datetime could cause 
-    # discrepancies in leaderboard data rendering at the turn of the year.
-    # =========================================================================
     year = request.args.get('year', datetime.now(timezone.utc).year, type=int)
     limit = request.args.get('limit', 10, type=int)
     
     try:
         from sqlalchemy import func
 
-        # Description
-        # where: app.py(get_leaderboard)
-        # issue: _get_yearly_stats is called inside the leaderboard loop, making additional queries per user
-        # why?: Combined with , this creates a severe N+1+N query pattern in the leaderboard endpoint, making it O(n) database calls.
-        # fix: Aggregate stats in a single SQL query using GROUP BY user_id alongside the leaderboard goal query.
         stats_query = db.session.query(
             ReadingGoal.user_id,
             User.username,
@@ -1439,7 +1560,6 @@ def get_leaderboard():
 @jwt_required()
 def create_collection():
     """Create a new collection."""
-    # Use get_json(silent=True) to avoid automatic 400 on malformed JSON
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -1454,7 +1574,6 @@ def create_collection():
     
     try:
         existing = Collection.query.filter_by(user_id=validated_data.user_id, name=validated_data.name).first()
-        
         if existing:
             return jsonify({"error": "Collection with this name already exists"}), 409
         
@@ -1516,7 +1635,6 @@ def get_collection(collection_id):
 @jwt_required()
 def update_collection(collection_id):
     """Update a collection."""
-    # Use get_json(silent=True) to avoid automatic 400 on malformed JSON
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -1582,7 +1700,6 @@ def delete_collection(collection_id):
 @jwt_required()
 def add_book_to_collection(collection_id):
     """Add a book to a collection."""
-    # Use get_json(silent=True) to avoid automatic 400 on malformed JSON
     data = request.get_json(silent=True)
     if data is None:
         return jsonify({"error": "Invalid or missing JSON body"}), 400
@@ -1612,7 +1729,6 @@ def add_book_to_collection(collection_id):
             db.session.flush()
         
         existing_item = CollectionItem.query.filter_by(collection_id=collection_id, book_id=book.id).first()
-        
         if existing_item:
             return jsonify({"error": "Book already in collection"}), 409
         
@@ -1641,7 +1757,6 @@ def get_collection_books(collection_id):
             return forbidden_error("Unauthorized")
         
         items = CollectionItem.query.filter_by(collection_id=collection_id).order_by(CollectionItem.added_at.desc()).all()
-        
         return jsonify({"collection": collection.to_dict(), "books": [item.to_dict() for item in items]}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3988,4 +4103,5 @@ if __name__ == '__main__':
         logger.info("  POST /api/v1/chat - Chat with bookseller")
         logger.info("  GET  /api/v1/health - Health check")
 
+    app.run(debug=server_config.debug, port=server_config.port, host=server_config.host)
     app.run(debug=server_config.debug, port=server_config.port, host=server_config.host)
