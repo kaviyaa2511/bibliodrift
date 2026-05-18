@@ -887,6 +887,30 @@ def handle_category_books():
         logger.error(f"Error in handle_category_books: {str(e)}", exc_info=True)
         return internal_error(str(e))
 
+
+@app.route('/api/v1/books/purchase-links', methods=['GET'])
+@rate_limit('purchase_links')
+def handle_purchase_links():
+    """Get purchase links for a book."""
+    try:
+        title = request.args.get('title')
+        author = request.args.get('author', '')
+        isbn = request.args.get('isbn', '')
+        
+        if not title:
+            return jsonify({'success': False, 'error': 'Title is required'}), 400
+            
+        from purchase_links import PurchaseManager
+        manager = PurchaseManager()
+        
+        links = manager.get_quick_links(title=title, author=author, isbn=isbn)
+        
+        return success_response(data={"links": links})
+        
+    except Exception as e:
+        logger.error(f"Error getting purchase links: {str(e)}", exc_info=True)
+        return internal_error(str(e))
+
 @app.route('/api/v1/generate-note', methods=['POST'])
 @rate_limit('generate_note')
 def handle_generate_note():
@@ -2129,6 +2153,12 @@ def get_price_history(book_id):
         
         history = price_tracker.get_price_history(book_id=book.id, retailer=retailer, limit=limit)
         latest_prices = price_tracker.get_latest_prices(book.id)
+        
+        # If no history exists, fetch the current price and record it
+        if not history and not latest_prices:
+            price_tracker.update_prices_for_book(book.id, book.google_books_id)
+            history = price_tracker.get_price_history(book_id=book.id, retailer=retailer, limit=limit)
+            latest_prices = price_tracker.get_latest_prices(book.id)
         
         return jsonify({
             "book_id": book.id,
