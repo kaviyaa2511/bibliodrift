@@ -94,6 +94,31 @@
                     </div>
                 </div>
 
+                <!-- Yearly Reading Goal -->
+                <div class="profile-stat-box reading-goal-box" style="margin-top: 1rem;">
+                    <h3 class="progress-title"><i class="fa-solid fa-bullseye"></i> <span id="current-year-display">2024</span> Reading Goal</h3>
+                    <div id="goal-container">
+                        <div class="goal-stats" style="margin: 1rem 0;">
+                            <span id="goal-progress-text">0 / 0 books</span>
+                            <div class="progress-bar-container" style="height: 10px; margin-top: 5px;">
+                                <div id="bar-goal" class="progress-segment finished" style="width: 0%; background: var(--accent-color);"></div>
+                            </div>
+                        </div>
+                        <div class="goal-input-group" style="display: none; gap: 10px; margin-bottom: 1rem;" id="goal-edit-group">
+                            <input type="number" id="goal-input" min="1" max="1000" placeholder="Books" style="width: 80px; padding: 5px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--card-bg); color: var(--text-color);">
+                            <button id="save-goal-btn" class="action-btn-primary" style="padding: 5px 15px; font-size: 0.8rem;">Save</button>
+                        </div>
+                        <div class="profile-actions">
+                            <span id="streak-badge" title="Reading Streak" style="display: none; background: #ff980022; color: #ff9800; padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; margin-right: 10px;">
+                                <i class="fa-solid fa-fire"></i> <span id="streak-count">0</span> day streak
+                            </span>
+                            <button id="edit-goal-btn" class="action-btn-secondary" style="font-size: 0.8rem; padding: 4px 10px;">
+                                <i class="fa-solid fa-pen"></i> Edit Goal
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="progress-breakdown profile-stat-box">
                     <h3 class="progress-title"><i class="fa-solid fa-chart-bar"></i> Reading Progress</h3>
                     <div class="progress-bar-container">
@@ -152,6 +177,13 @@
                     <div class="empty-state">
                         <p>No recent activity recorded.</p>
                     </div>
+                </div>
+            </div>
+
+            <div class="leaderboard-section profile-stat-box" id="leaderboard-section" style="display: none; margin-top: 2rem;">
+                <h2><i class="fa-solid fa-ranking-star"></i> Reading Leaderboard</h2>
+                <div id="leaderboard-list" style="margin-top: 1rem;">
+                    <!-- Injected by JS -->
                 </div>
             </div>
         </section>
