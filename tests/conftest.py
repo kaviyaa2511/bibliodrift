@@ -18,10 +18,23 @@ for p in (ROOT, BACKEND):
         sys.path.insert(0, p)
 
 # Stub out heavy optional packages so tests don't need GPU/model downloads
-for _mod in ["torch", "transformers", "sentence_transformers", "sklearn",
-             "scipy", "numpy", "pandas", "nltk", "huggingface_hub",
-             "safetensors", "tokenizers", "tqdm", "joblib"]:
+for _mod in [
+    "transformers", "sentence_transformers",
+    "nltk", "nltk.tokenize", "nltk.tokenize.api",
+    "huggingface_hub", "safetensors", "tokenizers", "tqdm", "joblib",
+    "textblob", "textblob.blob", "textblob.base",
+]:
     sys.modules.setdefault(_mod, MagicMock())
+
+# Set required env vars before importing app so validation passes
+os.environ.setdefault("GOOGLE_BOOKS_API_KEY", "fake-key-for-testing")
+os.environ.setdefault("SECRET_KEY", "test-secret-key")
+os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key")
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+os.environ.setdefault("OPENAI_API_KEY", "fake-openai-key")
+os.environ.setdefault("GROQ_API_KEY", "fake-groq-key")
+os.environ.setdefault("GEMINI_API_KEY", "fake-gemini-key")
+os.environ.setdefault("FLASK_ENV", "testing")
 
 from backend.app import app as flask_app
 from backend.models import db as _db, User
