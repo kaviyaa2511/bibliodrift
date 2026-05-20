@@ -1170,6 +1170,36 @@ main {
     color: var(--text-main);
 }
 
+/* Theme-safe modal sub-elements */
+.modal-section-title,
+.purchase-header,
+.purchase-links-box,
+.emotion-tagging-section {
+    color: var(--text-main);
+}
+
+.emotion-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 5px 12px;
+    border-radius: 20px;
+    font-size: 0.82rem;
+    cursor: pointer;
+    border: 1px solid var(--control-border);
+    background: var(--surface-soft);
+    color: var(--text-main);
+    transition: all 0.2s ease;
+    margin: 3px 2px;
+}
+
+.emotion-tag:hover,
+.emotion-tag.active {
+    background: var(--accent-gold);
+    color: #2c2420;
+    border-color: var(--accent-gold);
+}
+
 .modal-actions {
     margin-top: auto;
     display: flex;
