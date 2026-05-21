@@ -32,3 +32,5 @@ instance/
 *.db
 # Virtual Environment
 venv/
+
+node_modules/
